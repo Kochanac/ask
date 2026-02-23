@@ -9,8 +9,7 @@ use rig::completion::Message;
 use rig::message::UserContent;
 use rig::providers;
 use rig::streaming::StreamingPrompt;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 /// Events that can be emitted by the agent
@@ -49,63 +48,62 @@ pub enum AgentEvent {
     },
 }
 
-/// AskAgent wraps rig::agent::Agent with application-specific configuration
-/// and manages an event stream for decoupled UI interaction
+/// AskAgent wraps rig::agent::Agent with application-specific configuration.
+/// It emits events to an async channel. The caller receives the receiver side
+/// to consume events.
 pub struct AskAgent {
     pub inner: Agent<providers::openrouter::CompletionModel, SessionIdHook>,
-    /// Shared event buffer for UI to consume (protected by Mutex)
-    pub events: Arc<Mutex<VecDeque<AgentEvent>>>,
+    /// Sender for events (not exposed publicly; used by hook)
+    events_tx: mpsc::UnboundedSender<AgentEvent>,
 }
 
 impl AskAgent {
-    /// Initialize a new agent with the comedian personality and tools
-    pub async fn init() -> Result<Self> {
+    /// Initialize a new agent with the comedian personality and tools.
+    /// Returns the agent and an unbounded receiver for events.
+    pub async fn init() -> Result<(Self, mpsc::UnboundedReceiver<AgentEvent>)> {
         // Create OpenRouter client
         let client = providers::openrouter::Client::from_env();
 
-        // Create shared event buffer
-        let events = Arc::new(Mutex::new(VecDeque::new()));
-        let hook = SessionIdHook::new(events.clone());
+        // Create unbounded channel for events
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let hook = SessionIdHook::new(events_tx.clone());
 
-        // Create agent with a single context prompt
-        let comedian_agent = client
+        let agent = client
             .agent("qwen/qwen3-coder-next")
             .hook(hook)
-            .preamble("You are a helpful assistant.")
-            .default_max_turns(20)
+            .preamble("You are a helpful agent. Use tools that are provided to you to complete the user's task. Never ask user to do something, that you can do yourself.")
+            .default_max_turns(100)
             .tool(crate::tool::Bash)
             .tool(crate::tool::ReadFile)
             .build();
 
-        // Return wrapped agent
-        Ok(AskAgent {
-            inner: comedian_agent,
-            events,
-        })
+        // Return wrapped agent and the receiver
+        Ok((
+            AskAgent {
+                inner: agent,
+                events_tx,
+            },
+            events_rx,
+        ))
     }
 
-    /// Send a user message to the agent and process it asynchronously
-    /// This will trigger the agent to respond and generate events
+    /// Send a user message to the agent and process it asynchronously.
+    /// Emits events to the event channel, including the user message itself.
     pub async fn send_user_message(&self, message: String) -> Result<()> {
-        let user_message = message.clone();
-        // Clear previous events first, then record the new user message
-        {
-            let mut events = self.events.lock().unwrap();
-            events.clear();
-            events.push_back(AgentEvent::UserMessage(user_message.clone()));
-        }
+        // Emit user message event
+        self.events_tx
+            .send(AgentEvent::UserMessage(message.clone()))
+            .ok();
 
         // Convert to rig Message
         use rig::OneOrMany;
-        let user_content = OneOrMany::one(UserContent::text(user_message));
+        let user_content = OneOrMany::one(UserContent::text(message));
         let rig_message = Message::User { content: user_content };
 
         // Stream the response with a total timeout to avoid hanging forever.
         let mut stream = self.inner.stream_prompt(rig_message).await;
         let stream_future = async {
             while let Some(chunk) = stream.next().await {
-                // Drain the stream; hooks push events.
-                // Convert any streaming error to anyhow::Error
                 chunk.map_err(anyhow::Error::from)?;
             }
             Ok::<(), anyhow::Error>(())
@@ -114,16 +112,5 @@ impl AskAgent {
         timeout(Duration::from_secs(120), stream_future).await??;
 
         Ok(())
-    }
-
-    /// Get all pending events from the agent's event stream
-    pub fn get_events(&self) -> Vec<AgentEvent> {
-        let mut events = self.events.lock().unwrap();
-        events.drain(..).collect()
-    }
-
-    /// Get the number of pending events
-    pub fn event_count(&self) -> usize {
-        self.events.lock().unwrap().len()
     }
 }

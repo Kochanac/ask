@@ -1,13 +1,23 @@
 use ask::{AskAgent, AgentEvent};
 use std::time::Duration;
 use tokio;
+use tokio::sync::mpsc;
 
 /// Helper to get all events after sending a message
-async fn get_events_after(agent: &AskAgent, prompt: &str) -> Vec<AgentEvent> {
+/// Takes a mutable reference to the (agent, receiver) tuple.
+async fn get_events_after(
+    (agent, rx): &mut (AskAgent, mpsc::UnboundedReceiver<AgentEvent>),
+    prompt: &str,
+) -> Vec<AgentEvent> {
     agent.send_user_message(prompt.to_string()).await.unwrap();
     // Small delay to ensure all events are flushed
     tokio::time::sleep(Duration::from_millis(100)).await;
-    agent.get_events()
+    // Drain all pending events from the receiver
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
 }
 
 #[tokio::test]
@@ -18,9 +28,9 @@ async fn test_simple_text_response() {
         return;
     }
 
-    let agent = AskAgent::init().await.unwrap();
+    let mut agent_tuple = AskAgent::init().await.unwrap();
 
-    let events = get_events_after(&agent, "Say hello in one word.").await;
+    let events = get_events_after(&mut agent_tuple, "Say hello in one word.").await;
 
     // Verify we got some text back
     let text_events: Vec<&AgentEvent> = events.iter().filter(|e| matches!(e, AgentEvent::Text(_))).collect();
@@ -45,10 +55,10 @@ async fn test_tool_call_emits_events() {
         return;
     }
 
-    let agent = AskAgent::init().await.unwrap();
+    let mut agent_tuple = AskAgent::init().await.unwrap();
 
     // Prompt that should trigger a bash command: list files
-    let events = get_events_after(&agent, "List files in the current directory using the bash tool.").await;
+    let events = get_events_after(&mut agent_tuple, "List files in the current directory using the bash tool.").await;
 
     // Check for at least one ToolCall
     let tool_calls: Vec<&AgentEvent> = events.iter().filter(|e| matches!(e, AgentEvent::ToolCall { .. })).collect();
@@ -72,10 +82,10 @@ async fn test_user_message_event_included() {
         return;
     }
 
-    let agent = AskAgent::init().await.unwrap();
+    let mut agent_tuple = AskAgent::init().await.unwrap();
 
     let prompt = "What is the capital of France?";
-    let events = get_events_after(&agent, prompt).await;
+    let events = get_events_after(&mut agent_tuple, prompt).await;
 
     // The first event should be the UserMessage
     let first_event = events.first().unwrap();
@@ -93,9 +103,9 @@ async fn test_multiple_text_chunks_aggregated() {
         return;
     }
 
-    let agent = AskAgent::init().await.unwrap();
+    let mut agent_tuple = AskAgent::init().await.unwrap();
 
-    let events = get_events_after(&agent, "Tell me a short joke.").await;
+    let events = get_events_after(&mut agent_tuple, "Tell me a short joke.").await;
 
     // Collect all text events
     let mut full_text = String::new();

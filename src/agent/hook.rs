@@ -1,21 +1,20 @@
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, CompletionResponse, Message};
-use rig::message::{AssistantContent, UserContent};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use rig::message::AssistantContent;
+use tokio::sync::mpsc;
 
 use crate::AgentEvent;
 
 /// SessionIdHook for logging agent actions and capturing events
 #[derive(Clone)]
 pub struct SessionIdHook {
-    /// Shared event buffer
-    events: Arc<Mutex<VecDeque<AgentEvent>>>,
+    /// Sender for events
+    events_tx: mpsc::UnboundedSender<AgentEvent>,
 }
 
 impl SessionIdHook {
-    pub fn new(events: Arc<Mutex<VecDeque<AgentEvent>>>) -> Self {
-        Self { events }
+    pub fn new(events_tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self { events_tx }
     }
 }
 
@@ -27,14 +26,14 @@ impl<M: CompletionModel> PromptHook<M> for SessionIdHook {
         internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
-        let mut events = self.events.lock().unwrap();
-        events.push_back(AgentEvent::ToolCall {
-            tool_name: tool_name.to_string(),
-            args: args.to_string(),
-            tool_call_id,
-            internal_call_id: internal_call_id.to_string(),
-        });
-
+        self.events_tx
+            .send(AgentEvent::ToolCall {
+                tool_name: tool_name.to_string(),
+                args: args.to_string(),
+                tool_call_id,
+                internal_call_id: internal_call_id.to_string(),
+            })
+            .ok();
         ToolCallHookAction::Continue
     }
 
@@ -46,48 +45,22 @@ impl<M: CompletionModel> PromptHook<M> for SessionIdHook {
         _args: &str,
         result: &str,
     ) -> HookAction {
-        let mut events = self.events.lock().unwrap();
-        events.push_back(AgentEvent::ToolResult {
-            tool_name: tool_name.to_string(),
-            result: result.to_string(),
-            tool_call_id,
-        });
-
+        self.events_tx
+            .send(AgentEvent::ToolResult {
+                tool_name: tool_name.to_string(),
+                result: result.to_string(),
+                tool_call_id,
+            })
+            .ok();
         HookAction::cont()
     }
 
     async fn on_completion_call(
         &self,
-        prompt: &Message,
+        _prompt: &Message,
         _history: &[Message],
     ) -> HookAction {
-        let mut events = self.events.lock().unwrap();
-        // Convert prompt to text for event
-        let text = match prompt {
-            Message::User { content } => content
-                .iter()
-                .filter_map(|c| {
-                    if let UserContent::Text(text_content) = c {
-                        Some(text_content.text.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Message::Assistant { content, .. } => content
-                .iter()
-                .filter_map(|c| if let AssistantContent::Text(text_content) = c {
-                    Some(text_content.text.clone())
-                } else {
-                    None
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
-
-        // events.push_back(AgentEvent::UserMessage(text));
-
+        // UserMessage is emitted by AskAgent::send_user_message.
         HookAction::cont()
     }
 
@@ -96,20 +69,20 @@ impl<M: CompletionModel> PromptHook<M> for SessionIdHook {
         _prompt: &Message,
         response: &CompletionResponse<M::Response>,
     ) -> HookAction {
-        let mut events = self.events.lock().unwrap();
-        // Extract text from the response - choice contains AssistantContent
         for content in response.choice.iter() {
             if let AssistantContent::Text(text_content) = content {
-                events.push_back(AgentEvent::Text(text_content.text.clone()));
+                self.events_tx
+                    .send(AgentEvent::Text(text_content.text.clone()))
+                    .ok();
             }
         }
-
         HookAction::cont()
     }
 
     async fn on_text_delta(&self, text_delta: &str, _aggregated_text: &str) -> HookAction {
-        let mut events = self.events.lock().unwrap();
-        events.push_back(AgentEvent::Text(text_delta.to_string()));
+        self.events_tx
+            .send(AgentEvent::Text(text_delta.to_string()))
+            .ok();
         HookAction::cont()
     }
 
